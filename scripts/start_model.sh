@@ -95,8 +95,25 @@ download_model() {
     fi
 
     mkdir -p "$target"
-    if ! hf download "$repo" --local-dir "$target"; then
+    local dl_log="${LOG_DIR}/download_${name}_$(date +%Y%m%d_%H%M%S).log"
+    echo "下载进度详情写入: $dl_log (终端仅显示简要状态)"
+    echo -n "  下载中"
+
+    hf download "$repo" --local-dir "$target" > "$dl_log" 2>&1 &
+    local dl_pid=$!
+
+    while kill -0 "$dl_pid" 2>/dev/null; do
+        echo -n "."
+        sleep 5
+    done
+    wait "$dl_pid"
+    local dl_status=$?
+    echo ""
+
+    if [ $dl_status -ne 0 ]; then
         echo "[错误] 模型下载失败: $repo"
+        echo "       详情见: $dl_log"
+        tail -n 20 "$dl_log"
         exit 1
     fi
 
@@ -105,7 +122,9 @@ download_model() {
         exit 1
     fi
 
-    echo "模型下载完成: $target"
+    local size
+    size=$(du -sh "$target" 2>/dev/null | cut -f1)
+    echo "模型下载完成: $target (大小: ${size:-未知})"
 }
 
 ensure_model_available() {
@@ -334,6 +353,7 @@ ELAPSED=0
 
 echo "----- 启动进度 -----"
 
+LAST_HEARTBEAT=0
 while [ $ELAPSED -lt $MAX_WAIT ]; do
     if ! kill -0 "$NEW_PID" 2>/dev/null; then
         echo ""
@@ -345,12 +365,15 @@ while [ $ELAPSED -lt $MAX_WAIT ]; do
         exit 1
     fi
 
+    STAGE_HIT=0
     for idx in "${!STAGE_KEYWORDS[@]}"; do
         IFS='|' read -r PATTERN LABEL <<< "${STAGE_KEYWORDS[$idx]}"
         if [ -z "${STAGE_DONE[$idx]}" ] && grep -qE "$PATTERN" "$LOG_FILE" 2>/dev/null; then
             STAGE_DONE[$idx]=1
             DONE_COUNT=$((DONE_COUNT+1))
             echo "  [$DONE_COUNT/$TOTAL_STAGES] ✔ $LABEL"
+            STAGE_HIT=1
+            LAST_HEARTBEAT=$ELAPSED
             if [ "$PATTERN" = "Uvicorn running" ]; then
                 READY=1
             fi
@@ -358,6 +381,12 @@ while [ $ELAPSED -lt $MAX_WAIT ]; do
     done
 
     [ "$READY" -eq 1 ] && break
+
+    # 心跳提示:超过 8 秒没检测到新阶段,就每 8 秒提示一次仍在等待
+    if [ "$STAGE_HIT" -eq 0 ] && [ $((ELAPSED - LAST_HEARTBEAT)) -ge 8 ]; then
+        echo "  ...仍在等待下一阶段(已运行 ${ELAPSED}s,进程正常存活)"
+        LAST_HEARTBEAT=$ELAPSED
+    fi
 
     sleep 2
     ELAPSED=$((ELAPSED+2))
